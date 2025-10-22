@@ -19,7 +19,15 @@ The project uses a modern deep learning approach for high-accuracy face recognit
 ## Installation
 
 1. Clone the Repository
-```bash
-git clone https://github.com/your-username/RBC26_Recruitment_Face_Recognition_Project.git
-cd RBC26_Recruitment_Face_Recognition_Project
-```
+   ```bash
+   git clone https://github.com/your-username/RBC26_Recruitment_Face_Recognition_Project.git
+   cd RBC26_Recruitment_Face_Recognition_Project
+   ```
+2. Create a Virtual Environment (Recommended)
+   ```bash
+   python -m venv face_rec
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+   face_rec\Scripts\activate
+   ```
+3. Install 
+   
