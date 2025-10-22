@@ -27,7 +27,7 @@ The project uses a modern deep learning approach for high-accuracy face recognit
 2.  **Create a Virtual Environment** (Recommended)
     * Using Python 3.11 is suggested as the provided `dlib` wheel is for this version.
     ```bash
-    python3.11 -m venv face_rec
+    py -3.11 -m venv face_rec
     ```
     * Activate the environment:
         * **Windows (PowerShell):**
