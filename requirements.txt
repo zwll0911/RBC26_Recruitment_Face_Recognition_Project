@@ -1,0 +1,7 @@
+opencv-python
+face-recognition
+numpy
+Pillow
+torch
+facenet-pytorch
+imutils
