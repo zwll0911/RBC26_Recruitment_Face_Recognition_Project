@@ -13,9 +13,11 @@ DATASET_PATH = "dataset"
 IMAGE_COUNT = 50
 
 # --- FFmpeg Settings ---
-# Find this name by running: ffmpeg -list_devices true -f dshow -i dummy
+# Find camera detial by running: 
+# ffmpeg -list_devices true -f dshow -i dummy
+# ffmpeg -f dshow -list_options true -i "video=<CAMERA_NAME>"
 CAMERA_NAME = "USB2.0 HD UVC WebCam"  # <--- SET THIS TO YOUR CAMERA'S NAME
-CAM_WIDTH = 640
+CAM_WIDTH = 640  # SET CAM PARAM BASED ON YOUR CAMERA
 CAM_HEIGHT = 480
 CAM_FPS = 20
 
