@@ -26,11 +26,11 @@ The project uses a modern deep learning approach for high-accuracy face recognit
     ```
 
 2.  **Install FFmpeg** (Required for Primary Camera Capture)
-    * Download `ffmpeg` binaries for Windows (e.g., from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)).
-    * Extract the archive.
-    * Add the `bin` folder inside the extracted files to your system's **PATH environment variable**. You can verify by opening a *new* command prompt and typing `ffmpeg -version`.
+    ```bash
+    winget install --id=Gyan.FFmpeg -e
+    ```
 
-3.  **Create a Virtual Environment** (Recommended)
+4.  **Create a Virtual Environment** (Recommended)
     * Using Python 3.11 is suggested as the provided `dlib` wheel is for this version.
     ```bash
     py -3.11 -m venv face_rec
@@ -51,14 +51,14 @@ The project uses a modern deep learning approach for high-accuracy face recognit
             source face_rec/bin/activate
             ```
 
-4.  **Install the pre-compiled package for `dlib`**
+5.  **Install the pre-compiled package for `dlib`**
     * The `face-recognition` library depends on `dlib`, which can sometimes be tricky to install directly. Using the provided wheel file for Windows/Python 3.11 is the easiest way if it matches your system. Make sure the `.whl` file is in your project directory.
     ```bash
     python -m pip install dlib-19.24.1-cp311-cp311-win_amd64.whl
     ```
     > **Note:** If you are not on 64-bit Windows with Python 3.11, you might need to find a different `dlib` wheel file or try installing `dlib` directly (`pip install dlib`), which may require installing CMake and a C++ compiler first.
 
-5.  **Install Other Dependencies**
+6.  **Install Other Dependencies**
     * All other required libraries are listed in `requirements.txt`. Install them using `pip`:
     ```bash
     pip install -r requirements.txt
