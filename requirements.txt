@@ -1,7 +1,8 @@
-opencv-python
-face-recognition
 numpy
+opencv-python
 Pillow
 torch
+torchvision
+mediapipe
 facenet-pytorch
-imutils
+tqdm
