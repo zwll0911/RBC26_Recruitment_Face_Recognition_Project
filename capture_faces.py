@@ -1,60 +1,31 @@
-import cv2
-import os
-import face_recognition
-import numpy as np
-import time
-import sys
-import signal
-from PIL import Image
 import subprocess
+import os
+import time
+import numpy as np
+import mediapipe as mp
+import cv2
+import datetime
 
-# ---------------- Settings ----------------
-DATASET_PATH = "dataset"
-IMAGE_COUNT = 50
-
-# --- FFmpeg Settings ---
+# --- Configuration ---
 # Find camera detials by running: 
 # ffmpeg -list_devices true -f dshow -i dummy
 # ffmpeg -f dshow -list_options true -i "video=<CAMERA_NAME>"
-CAMERA_NAME = "USB2.0 HD UVC WebCam"  # <--- SET THIS TO YOUR CAMERA'S NAME
-CAM_WIDTH = 640  # SET CAM PARAM BASED ON YOUR CAMERA
+CAMERA_DSHOW_NAME = "USB2.0 HD UVC WebCam"
+CAM_WIDTH = 640
 CAM_HEIGHT = 480
-CAM_FPS = 20
+CAM_FPS = 30
+WARMUP_FRAMES = 15
+SAVE_DIR_BASE = "dataset"
 
-# --- General Settings ---
-WARMUP_FRAMES = 200
-BAD_FRAME_REOPEN_THRESHOLD = 80
-BAD_FRAME_PRINT_STEP = 10
-WARMUP_SLEEP = 0.02
-# ------------------------------------------
-
-# --- get name ---
-PERSON_NAME = ""
-while not PERSON_NAME:
-    PERSON_NAME = input("Enter your name: ").strip()
-    if not PERSON_NAME:
-        print("Name cannot be empty.")
-
-person_path = os.path.join(DATASET_PATH, PERSON_NAME)
-os.makedirs(person_path, exist_ok=True)
-print(f"Directory: {person_path}")
-
-# --- RESTORED: load Haar cascade (OpenCV fallback) ---
-haar = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-
-# ------------------ FFmpeg pipe capture class ------------------
+# --- FFMPEGPipeCapture Class ---
 class FFMPEGPipeCapture:
-    """
-    Uses ffmpeg (dshow) to capture raw BGR frames and streams them to Python.
-    Provides read(), is_opened(), release() methods.
-    """
-    def __init__(self, dshow_name, width=640, height=480, fps=20):
+    def __init__(self, dshow_name, width=CAM_WIDTH, height=CAM_HEIGHT, fps=CAM_FPS):
         self.width = int(width)
         self.height = int(height)
         self.frame_size = self.width * self.height * 3
         self._alive = False
         self.proc = None
-        
+
         cmd = [
             "ffmpeg",
             "-hide_banner", "-loglevel", "error",
@@ -67,11 +38,11 @@ class FFMPEGPipeCapture:
             "-an", "-sn",
             "-f", "rawvideo", "-"
         ]
-        
+
         popen_kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-            
+
         try:
             self.proc = subprocess.Popen(cmd, **popen_kwargs)
         except FileNotFoundError:
@@ -79,10 +50,15 @@ class FFMPEGPipeCapture:
         except Exception as e:
             raise RuntimeError(f"Failed to start ffmpeg: {e!r}")
 
-        time.sleep(0.5) 
+        # Check if ffmpeg started correctly after a short delay
+        time.sleep(0.5)
         if self.proc.poll() is not None:
-             stderr_output = self.proc.stderr.read().decode('utf-8', errors='ignore')
-             raise RuntimeError(f"ffmpeg process failed on startup. Error: {stderr_output}")
+              stderr_output = self.proc.stderr.read().decode('utf-8', errors='ignore')
+              if "Could not find video device" in stderr_output or "error opening device" in stderr_output:
+                   raise RuntimeError(f"ffmpeg could not find or open the DirectShow device named '{dshow_name}'. "
+                                      f"Please check camera connections and the exact device name. Error: {stderr_output}")
+              else:
+                   raise RuntimeError(f"ffmpeg process failed on startup. Error: {stderr_output}")
 
         self._alive = True
         print(f"ffmpeg pipe started for 'video={dshow_name}'")
@@ -90,267 +66,232 @@ class FFMPEGPipeCapture:
     def read(self, timeout=2.0):
         if not self.is_opened():
             return False, None
-        
+
         buf = b""
         bytes_to_read = self.frame_size
         t0 = time.time()
         while len(buf) < bytes_to_read:
             try:
                 chunk = self.proc.stdout.read(bytes_to_read - len(buf))
-            except Exception:
-                print("Error reading from ffmpeg stdout pipe.")
+            except Exception as e:
+                print(f"Error reading from ffmpeg stdout pipe: {e}")
                 self._alive = False
                 return False, None
 
             if not chunk:
-                print("ffmpeg process stdout pipe closed unexpectedly.")
+                poll_result = self.proc.poll()
+                stderr_output = self.proc.stderr.read().decode('utf-8', errors='ignore')
+                print(f"ffmpeg process stdout pipe closed unexpectedly. Poll result: {poll_result}. Stderr: {stderr_output}")
                 self._alive = False
                 return False, None
-                
+
             buf += chunk
-            
+
             if timeout is not None and (time.time() - t0) > timeout:
-                print(f"ffmpeg read timeout after {timeout}s")
+                print(f"ffmpeg read timeout after {timeout}s ({len(buf)}/{bytes_to_read} bytes read)")
+                try:
+                    stderr_output = self.proc.stderr.read(1024).decode('utf-8', errors='ignore')
+                    if stderr_output:
+                         print(f"ffmpeg stderr during timeout: {stderr_output}")
+                except Exception:
+                     pass
                 return False, None
-                
+
         frame = np.frombuffer(buf, dtype=np.uint8)
         try:
             frame = frame.reshape((self.height, self.width, 3))
-        except Exception as e:
-            print(f"Error reshaping frame buffer: {e}")
+        except ValueError as e:
+            print(f"Error reshaping frame buffer ({len(buf)} bytes read, expected {self.frame_size}): {e}")
             return False, None
-            
+        except Exception as e:
+            print(f"Unexpected error reshaping frame buffer: {e}")
+            return False, None
+
         return True, frame
 
     def is_opened(self):
         if self._alive and self.proc and self.proc.poll() is None:
             return True
-        self._alive = False
+        if self._alive:
+             print(f"ffmpeg process seems to have exited (poll result: {self.proc.poll()}).")
+             self._alive = False
         return False
 
     def release(self):
+        print("Releasing ffmpeg capture...")
         if self.proc is not None:
+            if self.proc.poll() is None:
+                 try:
+                     print("Terminating ffmpeg process...")
+                     self.proc.terminate()
+                     try:
+                         self.proc.wait(timeout=1.0)
+                         print("ffmpeg process terminated.")
+                     except subprocess.TimeoutExpired:
+                         print("ffmpeg did not terminate gracefully, killing...")
+                         self.proc.kill()
+                         self.proc.wait(timeout=1.0)
+                         print("ffmpeg process killed.")
+                 except Exception as e:
+                     print(f"Error during ffmpeg terminate/kill: {e}")
+            else:
+                 print("ffmpeg process was already terminated.")
+
             try:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    print("ffmpeg did not terminate, killing...")
-                    self.proc.kill()
-                    self.proc.wait(timeout=1.0)
+                 if self.proc.stdout: self.proc.stdout.close()
+                 if self.proc.stderr: self.proc.stderr.close()
             except Exception as e:
-                print(f"Error during ffmpeg release: {e}")
-            
-            try:
-                self.proc.stdout.close()
-                self.proc.stderr.close()
-            except Exception:
-                pass
+                 print(f"Error closing ffmpeg pipes: {e}")
 
         self.proc = None
         self._alive = False
+        print("ffmpeg capture released.")
+# --------------------------------------------------------
 
-# ------------------ Camera Functions ------------------
-def open_camera():
-    """Tries to open the camera using FFmpeg."""
+# --- Main Face Detection Loop ---
+if __name__ == "__main__":
+
+    user_name = input("Enter the name for saving faces: ").strip()
+    if not user_name:
+        print("Name cannot be empty. Exiting.")
+        exit()
+
+    save_path = os.path.join(SAVE_DIR_BASE, user_name)
+    os.makedirs(save_path, exist_ok=True)
+    print(f"Saving detected faces to: {save_path}")
+    # ----------------------------------------------------
+
+    ff_cap = None
+    mp_face_detection = mp.solutions.face_detection
+    face_detection = mp_face_detection.FaceDetection(
+        model_selection=0, min_detection_confidence=0.5
+    )
+
     try:
-        print(f"Trying FFmpeg pipe for camera '{CAMERA_NAME}'...")
-        ffcap = FFMPEGPipeCapture(CAMERA_NAME, width=CAM_WIDTH, height=CAM_HEIGHT, fps=CAM_FPS)
-        if ffcap.is_opened():
-            print("Successfully opened camera via FFmpeg pipe.")
-            return ffcap
-        else:
-            print("FFmpeg capture .is_opened() returned False.")
-            ffcap.release()
-            return None
-    except Exception as e:
-        print(f"Opening FFmpeg pipe failed: {e!r}")
-        return None
+        ff_cap = FFMPEGPipeCapture(CAMERA_DSHOW_NAME, CAM_WIDTH, CAM_HEIGHT, CAM_FPS)
+        if not ff_cap.is_opened():
+             raise RuntimeError(f"Could not open camera '{CAMERA_DSHOW_NAME}' via FFmpeg.")
 
-def warmup_camera(cap, tries=WARMUP_FRAMES):
-    print("Warming up camera...")
-    for i in range(tries):
-        ret, frame = cap.read()
-        if not ret or frame is None or getattr(frame, "size", 0) == 0:
-            if i % BAD_FRAME_PRINT_STEP == 0:
-                print(f"Warmup: bad frame {i+1}/{tries}")
-            time.sleep(WARMUP_SLEEP)
-            continue
-        try:
-            # We must make a writeable copy to test cvtColor
-            _ = cv2.cvtColor(frame.copy(), cv2.COLOR_BGR2RGB)
-            print("Camera warmup successful. RGB frame acquired.")
-            return True
-        except (cv2.error, RuntimeError):
-            if i % BAD_FRAME_PRINT_STEP == 0:
-                print(f"Warmup: unsupported frame type {i+1}/{tries}")
-            time.sleep(WARMUP_SLEEP)
-            continue
-    return False
+        print(f"Warming up camera for {WARMUP_FRAMES} frames...")
+        for _ in range(WARMUP_FRAMES):
+            ret, _ = ff_cap.read(timeout=2.0)
+            if not ret:
+                raise RuntimeError("Failed to read frame during camera warmup.")
+        print("Warmup complete.")
 
-# ------------------ Main ------------------
-cap = open_camera()
+        print("\nStarting face detection loop.")
+        print("Press 'S' in the window to save detected face(s).")
+        print("Press 'Q' in the window to stop.")
+        frame_count = 0
+        saved_face_count = 0
+        start_time = time.time()
 
-if not (cap and cap.is_opened()):
-    print("Could not open webcam. Check CAM_NAME, if ffmpeg is on PATH, & if other apps are using the camera.")
-    sys.exit(1)
+        while ff_cap.is_opened():
+            ret, frame_bgr_readonly = ff_cap.read(timeout=5.0)
+            if not ret or frame_bgr_readonly is None:
+                print("Failed to read frame from camera. Exiting loop.")
+                break
 
-if not warmup_camera(cap):
-    print(f"Failed to warm up camera after {WARMUP_FRAMES} attempts.")
-    cap.release()
-    sys.exit(1)
+            # Create a writable copy for drawing
+            frame_bgr = frame_bgr_readonly.copy()
 
-print("\nStarting video capture...")
-print("Press 's' to save (only saved when exactly 1 face is found). Press 'q' to quit.")
-print(f"Need {IMAGE_COUNT} images.")
+            # Convert BGR to RGB and ensure contiguous for MediaPipe
+            frame_rgb_non_contig = frame_bgr[:, :, ::-1]
+            frame_rgb = np.ascontiguousarray(frame_rgb_non_contig, dtype=np.uint8)
 
-saved_count = 0
-consecutive_bad_frames = 0
+            # MediaPipe Detection
+            frame_rgb.flags.writeable = False
+            results = face_detection.process(frame_rgb)
 
-def handle_sigint(signum, frame):
-    print("\nInterrupted. Exiting...")
-    try:
-        cap.release()
-    except Exception:
-        pass
-    cv2.destroyAllWindows()
-    sys.exit(0)
+            frame_count += 1
+            current_face_locations = [] # Store locations found in *this* frame
 
-signal.signal(signal.SIGINT, handle_sigint)
+            # Process detections and get coordinates
+            if results.detections:
+                ih, iw, _ = frame_bgr.shape # Get dimensions once
+                for detection in results.detections:
+                    bboxC = detection.location_data.relative_bounding_box
+                    if not hasattr(bboxC, 'xmin') or bboxC.xmin is None: continue
 
-try:
-    while saved_count < IMAGE_COUNT:
-        ret, frame = cap.read()
+                    xmin = int(bboxC.xmin * iw)
+                    ymin = int(bboxC.ymin * ih)
+                    width = int(bboxC.width * iw)
+                    height = int(bboxC.height * ih)
 
-        if not ret or frame is None or getattr(frame, "size", 0) == 0:
-            consecutive_bad_frames += 1
-            if consecutive_bad_frames % BAD_FRAME_PRINT_STEP == 0:
-                print(f"Warning: empty/failed frame. Consecutive bad: {consecutive_bad_frames}")
-            if consecutive_bad_frames >= BAD_FRAME_REOPEN_THRESHOLD:
-                print("Too many bad frames. Reopening camera...")
-                cap.release()
-                time.sleep(0.5)
-                cap = open_camera() # Try to reopen
-                            
-                if not (cap and cap.is_opened() and warmup_camera(cap)):
-                    print("Failed to recover camera. Exiting.")
-                    break
-                consecutive_bad_frames = 0
-            time.sleep(0.01)
-            continue
-        
-        # --- FIX: Make frame writeable ---
-        frame = frame.copy()
+                    # Ensure coordinates are within bounds and add padding if needed (optional)
+                    padding = 0 # Adjust padding if want slightly larger crops
+                    xmin = max(0, xmin - padding)
+                    ymin = max(0, ymin - padding)
+                    right = min(iw, xmin + width + padding * 2)
+                    bottom = min(ih, ymin + height + padding * 2)
+                    left = xmin
+                    top = ymin
 
-        # normalize: handle 4-channel, non-uint8, single-channel
-        if len(frame.shape) == 2 or (len(frame.shape) == 3 and frame.shape[2] == 1):
-            print(f"Skipping single-channel frame (shape={frame.shape}, dtype={frame.dtype})")
-            consecutive_bad_frames += 1
-            time.sleep(0.01)
-            continue
+                    if right > left and bottom > top:
+                         face_coords = (top, right, bottom, left)
+                         current_face_locations.append(face_coords)
+                         cv2.rectangle(frame_bgr, (left, top), (right, bottom), (0, 255, 0), 2)
 
-        if len(frame.shape) == 3 and frame.shape[2] == 4:
-            try:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            except cv2.error:
-                frame = frame[:, :, :3]
+            # Display the WRITABLE frame_bgr with boxes
+            cv2.imshow('Camera Feed (S=Save, Q=Quit)', frame_bgr)
 
-        if frame.dtype != np.uint8:
-            if np.issubdtype(frame.dtype, np.floating):
-                frame = np.clip(frame, 0.0, 1.0)
-                frame = (frame * 255.0).astype(np.uint8)
-            else:
-                frame = np.clip(frame, 0, 255).astype(np.uint8)
+            # --- Check for key presses ---
+            key = cv2.waitKey(1) & 0xFF
 
-        # convert to RGB
-        try:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        except cv2.error:
-            print("Failed BGR->RGB conversion, skipping this frame.")
-            consecutive_bad_frames += 1
-            continue
+            if key == ord('q'):
+                print("Quit key pressed.")
+                break
 
-        rgb_frame = np.ascontiguousarray(rgb_frame).copy()
-        consecutive_bad_frames = 0
+            elif key == ord('s'):
+                if current_face_locations:
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    num_saved_this_frame = 0
+                    for idx, (top, right, bottom, left) in enumerate(current_face_locations):
+                        # Crop the face from the BGR frame (the one we drew on is fine)
+                        face_crop = frame_bgr[top:bottom, left:right]
 
-        # --- RESTORED: Multi-step Face Detection with Fallback ---
-        face_locations = None
-        detector_used = None
+                        if face_crop.size == 0:
+                             print(f"  Skipping empty crop for face {idx+1}...")
+                             continue
 
-        # Attempt 1: direct call (Fastest)
-        try:
-            face_locations = face_recognition.face_locations(rgb_frame)
-            detector_used = "face_recognition"
-        except Exception as e1:
-            # Attempt 2: PIL roundtrip (Handles some memory layout issues)
-            try:
-                pil = Image.fromarray(rgb_frame)
-                arr = np.array(pil)
-                arr = np.ascontiguousarray(arr).copy()
-                face_locations = face_recognition.face_locations(arr)
-                detector_used = "face_recognition (PIL)"
-            except Exception as e2:
-                # Attempt 3: Haar cascade fallback (Handles non-RGB frames)
-                try:
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    faces = haar.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-                    if len(faces) > 0:
-                        face_locations = []
-                        for (x, y, w, h) in faces:
-                            top, left, bottom, right = y, x, y + h, x + w
-                            face_locations.append((top, right, bottom, left))
-                        detector_used = "opencv_haar (fallback)"
+                        # Create filename and save
+                        filename = f"{user_name}_{timestamp}_{idx+1}.jpg"
+                        filepath = os.path.join(save_path, filename)
+                        try:
+                            cv2.imwrite(filepath, face_crop)
+                            print(f"  Saved: {filepath}")
+                            num_saved_this_frame += 1
+                        except Exception as write_error:
+                            print(f"  Error saving {filepath}: {write_error}")
+
+                    if num_saved_this_frame > 0:
+                        saved_face_count += num_saved_this_frame
+                        print(f"Saved {num_saved_this_frame} face(s) this frame. Total saved: {saved_face_count}")
                     else:
-                        face_locations = []
-                        detector_used = "none (haar)"
-                except Exception as e3:
-                    print(f"All detectors failed. Error: {e3}")
-                    face_locations = []
-                    detector_used = "none (error)"
+                        print("Detected faces but failed to save any crops.")
+                else:
+                    print("Save ('s') pressed, but no faces detected in the current frame.")
+            # --------------------------------
 
-        # draw results
-        if face_locations is None:
-            status_text = "Error: Detector failed"
-            status_color = (0, 0, 255)
-        elif len(face_locations) == 1:
-            (top, right, bottom, left) = face_locations[0]
-            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
-            status_text = f"Face Detected: OK ({detector_used})"
-            status_color = (0, 255, 0)
-        elif len(face_locations) > 1:
-            status_text = f"Error: Multiple faces ({detector_used})"
-            status_color = (0, 0, 255)
-        else:
-            status_text = f"Error: No face ({detector_used})"
-            status_color = (0, 0, 255)
+            # Calculate FPS
+            elapsed_time = time.time() - start_time
+            if elapsed_time >= 1.0:
+                fps = frame_count / elapsed_time
+                print(f"FPS: {fps:.2f}")
+                frame_count = 0
+                start_time = time.time()
 
-        progress_text = f"Saved: {saved_count}/{IMAGE_COUNT}"
-        cv2.putText(frame, progress_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, status_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
-
-        cv2.imshow("Capture Faces - Press 's' to save, 'q' to quit", frame)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord('s'):
-            if face_locations is not None and len(face_locations) == 1:
-                image_path = os.path.join(person_path, f"{saved_count + 1:03d}.jpg")
-                cv2.imwrite(image_path, frame) 
-                print(f"Saved: {image_path}  (detector: {detector_used})")
-                saved_count += 1
-            else:
-                print(f"Not saved: {status_text}")
-        elif key == ord('q'):
-            print("Quitting.")
-            break
-
-except KeyboardInterrupt:
-    print("\nInterrupted by user. Exiting...")
-
-finally:
-    try:
-        cap.release()
-    except Exception:
-        pass
-    cv2.destroyAllWindows()
-    print(f"Captured {saved_count} images for {PERSON_NAME}.")
-
+    except KeyboardInterrupt:
+        print("\nStopping detection loop (Ctrl+C)...")
+    except RuntimeError as e:
+        print(f"Runtime Error: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+    finally:
+        # Release resources
+        if 'face_detection' in locals() and face_detection:
+             face_detection.close()
+        if ff_cap is not None:
+            ff_cap.release()
+        cv2.destroyAllWindows()
+        print("OpenCV windows closed.")
