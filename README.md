@@ -39,7 +39,7 @@ The project uses a modern deep learning approach for high-accuracy face recognit
     * **Other OS / Manual:** Download from the [FFmpeg website](https://ffmpeg.org/download.html) and ensure the `ffmpeg` executable is in your system's PATH.
 
 3.  **Create a Virtual Environment** (Recommended)
-    * Using Python 3.9+ is generally recommended for recent versions of these libraries (here we use python3.11.9).
+    * Using Python 3.9+ is generally recommended for recent versions of these libraries (here we use python 3.11.9).
     ```bash
     py -3.11 -m venv face_rec
     ```
