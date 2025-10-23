@@ -1,384 +1,311 @@
-import face_recognition
-import cv2
-import os
-import pickle
-import imutils
-import numpy as np
-import time
-import torch
-from PIL import Image
-from facenet_pytorch import MTCNN, InceptionResnetV1
 import subprocess
-import sys
-import signal
+import os
+import time
+import numpy as np
+import mediapipe as mp
+import cv2
+import pickle
+import torch
+from facenet_pytorch import InceptionResnetV1
+from PIL import Image
+import threading
 
-print("Starting video face recognition...")
-
-# --- Settings ---
-ENCODINGS_FILE = "encodings_facenet.pickle"
-RESIZE_WIDTH = 500
-TOLERANCE = 0.7
-FRAME_SKIP = 5
-
-# --- FFmpeg Settings ---
-CAMERA_NAME = "USB2.0 HD UVC WebCam"  # <--- SET THIS TO YOUR CAMERA'S NAME
+# --- Configuration ---
+# Find camera detials by running: 
+# ffmpeg -list_devices true -f dshow -i dummy
+# ffmpeg -f dshow -list_options true -i "video=<CAMERA_NAME>"
+CAMERA_DSHOW_NAME = "USB2.0 HD UVC WebCam"
 CAM_WIDTH = 640
 CAM_HEIGHT = 480
-CAM_FPS = 20
-
-# --- General Settings ---
-WARMUP_FRAMES = 200
-BAD_FRAME_REOPEN_THRESHOLD = 80
-BAD_FRAME_PRINT_STEP = 10
-WARMUP_SLEEP = 0.02
-# ------------------------------------------
-
-# --- Load Encodings ---
-print(f"Loading known face encodings from {ENCODINGS_FILE}...")
-try:
-    with open(ENCODINGS_FILE, "rb") as f:
-        data = pickle.load(f)
-    # --- OPTIMIZATION: Convert known encodings to a single NumPy array for vectorized comparison ---
-    known_encodings_np = np.array(data["encodings"])
-    known_names = data["names"]
-except FileNotFoundError:
-    print(f"Error: Encodings file not found: {ENCODINGS_FILE}")
-    print("Please run your 'encode_faces.py' first to create the file.")
-    sys.exit(1)
-
-# ------------------ FFmpeg pipe capture class ------------------
-class FFMPEGPipeCapture:
-    def __init__(self, dshow_name, width=640, height=480, fps=20):
-        self.width = int(width)
-        self.height = int(height)
-        self.frame_size = self.width * self.height * 3 
-        self._alive = False
-        self.proc = None
-        
-        cmd = [
-            "ffmpeg",
-            "-hide_banner", "-loglevel", "error",
-            "-f", "dshow",
-            "-framerate", str(fps),
-            "-video_size", f"{self.width}x{self.height}",
-            "-i", f"video={dshow_name}",
-            "-pix_fmt", "bgr24",
-            "-vcodec", "rawvideo",
-            "-an", "-sn",
-            "-f", "rawvideo", "-"
-        ]
-        
-        popen_kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-            
-        try:
-            self.proc = subprocess.Popen(cmd, **popen_kwargs)
-        except FileNotFoundError:
-            raise RuntimeError("ffmpeg not found — ensure ffmpeg is installed and on your system's PATH.")
-        except Exception as e:
-            raise RuntimeError(f"Failed to start ffmpeg: {e!r}")
-
-        time.sleep(0.5) 
-        if self.proc.poll() is not None:
-             stderr_output = self.proc.stderr.read().decode('utf-8', errors='ignore')
-             raise RuntimeError(f"ffmpeg process failed on startup. Error: {stderr_output}")
-
-        self._alive = True
-        print(f"ffmpeg pipe started for 'video={dshow_name}'")
-
-    def read(self, timeout=2.0):
-        if not self.is_opened():
-            return False, None
-        
-        buf = b""
-        bytes_to_read = self.frame_size
-        t0 = time.time()
-        while len(buf) < bytes_to_read:
-            try:
-                chunk = self.proc.stdout.read(bytes_to_read - len(buf))
-            except Exception:
-                print("Error reading from ffmpeg stdout pipe.")
-                self._alive = False
-                return False, None
-
-            if not chunk:
-                print("ffmpeg process stdout pipe closed unexpectedly.")
-                self._alive = False
-                return False, None
-                
-            buf += chunk
-            
-            if timeout is not None and (time.time() - t0) > timeout:
-                print(f"ffmpeg read timeout after {timeout}s")
-                return False, None
-                
-        frame = np.frombuffer(buf, dtype=np.uint8)
-        try:
-            frame = frame.reshape((self.height, self.width, 3))
-        except Exception as e:
-            print(f"Error reshaping frame buffer: {e}")
-            return False, None
-            
-        return True, frame
-
-    def is_opened(self):
-        if self._alive and self.proc and self.proc.poll() is None:
-            return True
-        self._alive = False
-        return False
-
-    def release(self):
-        if self.proc is not None:
-            try:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    print("ffmpeg did not terminate, killing...")
-                    self.proc.kill()
-                    self.proc.wait(timeout=1.0)
-            except Exception as e:
-                print(f"Error during ffmpeg release: {e}")
-            
-            try:
-                self.proc.stdout.close()
-                self.proc.stderr.close()
-            except Exception:
-                pass
-
-        self.proc = None
-        self._alive = False
-
-# ------------------ Camera Functions (Simplified) ------------------
-
-def warmup_camera(cap, tries=WARMUP_FRAMES):
-    print("Warming up camera...")
-    for i in range(tries):
-        ret, frame = cap.read()
-        if not ret or frame is None or getattr(frame, "size", 0) == 0:
-            if i % BAD_FRAME_PRINT_STEP == 0:
-                print(f"Warmup: bad frame {i+1}/{tries}")
-            time.sleep(WARMUP_SLEEP)
-            continue
-        try:
-            _ = cv2.cvtColor(frame.copy(), cv2.COLOR_BGR2RGB)
-            print("Camera warmup successful. RGB frame acquired.")
-            return True
-        except (cv2.error, RuntimeError):
-            if i % BAD_FRAME_PRINT_STEP == 0:
-                print(f"Warmup: unsupported frame type {i+1}/{tries}")
-            time.sleep(WARMUP_SLEEP)
-            continue
-    return False
-# -----------------------------------------------------------------
-
-# --- Load FaceNet Models ---
-print("Loading FaceNet models...")
+CAM_FPS = 30
+WARMUP_FRAMES = 15
+ENCODING_FILE = "encodings_facenet.pickle"
+RECOGNITION_THRESHOLD = 0.7
 BATCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+RESIZE_DIM_FACENET = (160, 160)
+FRAME_PROCESS_INTERVAL = 4
+# -------------------------------
+
 print(f"Using device: {BATCH_DEVICE}")
-mtcnn = MTCNN(
-    keep_all=True,
-    device=BATCH_DEVICE,
-    min_face_size=40
-)
-resnet = InceptionResnetV1(pretrained='vggface2').eval().to(BATCH_DEVICE)
-print("FaceNet models loaded.")
-
-# --- Start Camera (Simplified) ---
-try:
-    print(f"Trying FFmpeg pipe for camera '{CAMERA_NAME}'...")
-    cap = FFMPEGPipeCapture(CAMERA_NAME, width=CAM_WIDTH, height=CAM_HEIGHT, fps=CAM_FPS)
-    if not cap.is_opened():
-        raise RuntimeError("FFMPEGPipeCapture .is_opened() returned False.")
-    print("Successfully opened camera via FFmpeg pipe.")
-except Exception as e:
-    print(f"Failed to open camera via FFmpeg: {e!r}")
-    print("Ensure ffmpeg is on PATH and CAMERA_NAME is correct.")
-    sys.exit(1)
+print(f"Processing every {FRAME_PROCESS_INTERVAL} frames.")
 
 
-if not warmup_camera(cap):
-    print(f"Failed to warm up camera after {WARMUP_FRAMES} attempts.")
-    cap.release()
-    sys.exit(1)
-
-print("Webcam started. Starting recognition...")
-
-# --- Graceful Exit Handler ---
-def handle_sigint(signum, frame):
-    print("\nInterrupted. Exiting...")
-    try:
-        cap.release()
-    except Exception:
-        pass
-    cv2.destroyAllWindows()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, handle_sigint)
-
-# --- Optimization Variables ---
-consecutive_bad_frames = 0
-frame_count = 0
-last_boxes = None
-last_names = []
-scale_y = 1.0
-scale_x = 1.0
-
-# --- Main Loop ---
-try:
-    while True:
-        ret, frame = cap.read()
-        
-        if not ret or frame is None or frame.size == 0:
-            consecutive_bad_frames += 1
-            if consecutive_bad_frames % BAD_FRAME_PRINT_STEP == 0:
-                print(f"Warning: empty/failed frame. Consecutive bad: {consecutive_bad_frames}")
-            if consecutive_bad_frames >= BAD_FRAME_REOPEN_THRESHOLD:
-                print("Too many bad frames. Reopening camera...")
-                cap.release()
-                time.sleep(0.5)
+# --- FFMPEGPipeCapture Class ---
+class FFMPEGPipeCapture:
+    def __init__(self, dshow_name, width=CAM_WIDTH, height=CAM_HEIGHT, fps=CAM_FPS):
+        self.width=int(width);self.height=int(height);self.frame_size=self.width*self.height*3;self._alive=False;self.proc=None
+        cmd=["ffmpeg","-hide_banner","-loglevel","error","-f","dshow","-framerate",str(fps),"-video_size",f"{self.width}x{self.height}","-i",f"video={dshow_name}","-pix_fmt","bgr24","-vcodec","rawvideo","-an","-sn","-f","rawvideo","-"]
+        popen_kwargs={"stdin":subprocess.DEVNULL,"stdout":subprocess.PIPE,"stderr":subprocess.PIPE}
+        if os.name=="nt":popen_kwargs["creationflags"]=subprocess.CREATE_NO_WINDOW
+        try:self.proc=subprocess.Popen(cmd,**popen_kwargs)
+        except FileNotFoundError:raise RuntimeError("ffmpeg not found.")
+        except Exception as e:raise RuntimeError(f"Failed start: {e!r}")
+        time.sleep(0.5)
+        if self.proc.poll() is not None:
+            stderr_output=self.proc.stderr.read().decode('utf-8',errors='ignore')
+            if"Could not find video device"in stderr_output or"error opening device"in stderr_output:raise RuntimeError(f"ffmpeg bad device '{dshow_name}'. Err: {stderr_output}")
+            else:raise RuntimeError(f"ffmpeg startup fail. Err: {stderr_output}")
+        self._alive=True;print(f"ffmpeg pipe started for '{dshow_name}'")
+    def read(self,timeout=2.0):
+        if not self.is_opened():return False,None
+        buf=b"";bytes_to_read=self.frame_size;t0=time.time()
+        while len(buf)<bytes_to_read:
+            try:chunk=self.proc.stdout.read(bytes_to_read-len(buf))
+            except Exception as e:print(f"Read pipe err: {e}");self._alive=False;return False,None
+            if not chunk:
+                poll_result=self.proc.poll();stderr_output=self.proc.stderr.read().decode('utf-8',errors='ignore')
+                print(f"Pipe closed. Poll:{poll_result}. Stderr:{stderr_output}");self._alive=False;return False,None
+            buf+=chunk
+            if timeout is not None and(time.time()-t0)>timeout:
+                print(f"Read timeout ({len(buf)}/{bytes_to_read} bytes)")
                 try:
-                    cap = FFMPEGPipeCapture(CAMERA_NAME, width=CAM_WIDTH, height=CAM_HEIGHT, fps=CAM_FPS)
-                except Exception:
-                    cap = None
-                            
-                if not (cap and cap.is_opened() and warmup_camera(cap)):
-                    print("Failed to recover camera. Exiting.")
-                    break
-                consecutive_bad_frames = 0
-            time.sleep(0.01)
-            continue
-        
-        display_frame = frame.copy()
-        consecutive_bad_frames = 0 
-
-        # --- --- OPTIMIZATION: FRAME SKIPPING --- ---
-        if frame_count % FRAME_SKIP == 0:
-
-            # --- OPTIMIZATION: Resize only when processing ---
-            process_frame = imutils.resize(display_frame, width=RESIZE_WIDTH)
-            
-            scale_y = display_frame.shape[0] / process_frame.shape[0]
-            scale_x = display_frame.shape[1] / process_frame.shape[1]
-
-            boxes = None
-            current_face_names = []
-            
+                    stderr_output=self.proc.stderr.read(1024).decode('utf-8',errors='ignore')
+                    if stderr_output:print(f"ffmpeg stderr: {stderr_output}")
+                except Exception:pass
+                return False,None
+        frame=np.frombuffer(buf,dtype=np.uint8)
+        try:frame=frame.reshape((self.height,self.width,3))
+        except ValueError as e:print(f"Reshape err({len(buf)} bytes): {e}");return False,None
+        except Exception as e:print(f"Unexpected reshape err: {e}");return False,None
+        return True,frame
+    def is_opened(self):
+        if self._alive and self.proc and self.proc.poll() is None:return True
+        if self._alive:print(f"ffmpeg exited (poll:{self.proc.poll()}).");self._alive=False
+        return False
+    def release(self):
+        print("Releasing ffmpeg...")
+        if self.proc is not None:
+            if self.proc.poll()is None:
+                try:
+                    print("Terminating ffmpeg...")
+                    self.proc.terminate()
+                    try:self.proc.wait(timeout=1.0);print("Terminated.")
+                    except subprocess.TimeoutExpired:
+                        print("Killing...");self.proc.kill()
+                        try:self.proc.wait(timeout=1.0);print("Killed.")
+                        except subprocess.TimeoutExpired:print("Kill timed out.")
+                        except Exception as we:print(f"Wait kill err: {we}")
+                except Exception as te:print(f"Term/kill err: {te}")
+            else:print("ffmpeg already terminated.")
             try:
-                # --- OPTIMIZATION: Detect from RGB NumPy array, not PIL Image ---
-                rgb_process_frame = cv2.cvtColor(process_frame, cv2.COLOR_BGR2RGB)
-                
-                # 1. Detect ONCE. post_process=False is slightly faster.
-                boxes, probs = mtcnn.detect(rgb_process_frame, landmarks=False) # Landmarks=False is faster
-                
-                if boxes is not None:
-                    # 2. EXTRACT from boxes, don't detect again
-                    face_tensors = mtcnn.extract(rgb_process_frame, boxes, save_path=None)
-                else:
-                    face_tensors = None # No faces found
+                if self.proc.stdout:self.proc.stdout.close()
+                if self.proc.stderr:self.proc.stderr.close()
+                print("ffmpeg pipes closed.")
+            except Exception as e:print(f"Pipe close err: {e}")
+        self.proc=None;self._alive=False;print("ffmpeg capture released.")
+# --------------------------------------------------------
 
-                if face_tensors is not None:
-                    face_tensors = face_tensors.to(BATCH_DEVICE)
-                    
-                    with torch.no_grad():
-                        embeddings = resnet(face_tensors)
-                    
-                    # embeddings_np is shape (N, 512) where N is num faces
-                    embeddings_np = embeddings.cpu().numpy()
+# --- Helper: Preprocess face crop for FaceNet ---
+def preprocess_face_tensor(face_crop_pil, device):
+    if face_crop_pil is None: return None
+    try:
+        resized = face_crop_pil.resize(RESIZE_DIM_FACENET, Image.Resampling.LANCZOS)
+        face_np = np.array(resized, dtype=np.float32) / 255.0
+        face_np = (face_np - 0.5) * 2.0 # Normalize [-1, 1]
+        face_tensor = torch.as_tensor(face_np).permute(2, 0, 1) # HWC to CHW
+        return face_tensor # Keep on CPU initially for batching
+    except Exception as e: print(f"Error preprocessing face: {e}"); return None
 
-                    # Check if we have any known faces to compare against
-                    if known_encodings_np.size > 0:
-                        # 1. Compute all KxN distances at once using broadcasting
-                        # (K, 1, 512) - (1, N, 512) -> (K, N, 512) -> (K, N)
-                        diff = known_encodings_np[:, np.newaxis, :] - embeddings_np[np.newaxis, :, :]
-                        face_distances_matrix = np.linalg.norm(diff, axis=2)
+# --- Threading Globals ---
+latest_frame = None
+frame_lock = threading.Lock()
+stop_event = threading.Event()
+# -----------------------------
 
-                        # 2. Find best match (smallest distance) for each detected face (N)
-                        #    axis=0 finds the minimum value down each column
-                        best_match_indices = np.argmin(face_distances_matrix, axis=0) # shape (N,)
-                        
-                        # 3. Get the distance value for each best match
-                        best_match_distances = face_distances_matrix[best_match_indices, np.arange(len(best_match_indices))] # shape (N,)
-
-                        # 4. Check if these distances are within tolerance
-                        matches = best_match_distances <= TOLERANCE # shape (N,)
-                        
-                        # 5. Build the name list
-                        current_face_names = []
-                        for i, match in enumerate(matches):
-                            if match:
-                                name = known_names[best_match_indices[i]]
-                            else:
-                                name = "Unknown"
-                            current_face_names.append(name)
-                    else:
-                        # No known faces, label all as Unknown
-                        current_face_names = ["Unknown"] * len(embeddings_np)
-
-                # Store results for skipped frames
-                last_boxes = boxes
-                last_names = current_face_names
-
-            except (RuntimeError, cv2.error, TypeError) as e:
-                # Catch errors (like the 'no len' error, or 'bad frame')
-                print(f"Warning: Skipping bad frame. Error: {e}")
-                cv2.putText(display_frame, "Error: Bad camera frame", (10, 30), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                last_boxes = None
-                last_names = []
-        else:
-            # Use the results from the last processed frame
-            boxes = last_boxes
-            current_face_names = last_names
-        
-        # --- Drawing (runs every frame for smoothness) ---
-        if boxes is not None:
-            for (left, top, right, bottom), name in zip(boxes, current_face_names):
-                
-                # Scale the box coordinates back to the original frame size
-                top = int(top * scale_y)
-                right = int(right * scale_x)
-                bottom = int(bottom * scale_y)
-                left = int(left * scale_x)
-
-                if name == "Unknown":
-                    box_color = (0, 0, 255) # Red
-                else:
-                    box_color = (0, 255, 0) # Green
-
-                cv2.rectangle(display_frame, (left, top), (right, bottom), box_color, 2)
-                
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.7
-                font_thickness = 2
-                (text_w, text_h), baseline = cv2.getTextSize(name, font, font_scale, font_thickness)
-                
-                text_y = top - 10 
-                box_top = top - text_h - 20 
-                box_bottom = top - 5 
-                
-                if box_top < 0:
-                    box_top = top + 5
-                    box_bottom = top + text_h + 20
-                    text_y = top + text_h + 10 
-                
-                cv2.rectangle(display_frame, (left, box_top), (left + text_w + 10, box_bottom), box_color, cv2.FILLED)
-                cv2.putText(display_frame, name, (left + 5, text_y), font, font_scale, (255, 255, 255), font_thickness)
-
-        cv2.imshow('Face Recognition - Press "q" to quit', display_frame)
-        
-        frame_count += 1
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("Quitting...")
+# --- Capture Thread Function ---
+def capture_thread_func(pipe_cap):
+    global latest_frame
+    print("Capture thread started.")
+    while not stop_event.is_set():
+        if not pipe_cap.is_opened():
+            print("Capture device closed in thread.")
             break
+        # --- Increased read timeout ---
+        ret, frame = pipe_cap.read(timeout=5.0)
+        # ----------------------------
+        if ret and frame is not None:
+            with frame_lock:
+                latest_frame = frame # Update shared frame
+        elif pipe_cap.is_opened():
+            time.sleep(0.01) # Avoid busy-waiting if read fails temporarily
+        else: # Pipe closed
+             break # Exit thread if pipe is closed
+    print("Capture thread finished.")
+# ---------------------------------
 
-except KeyboardInterrupt:
-    print("\nInterrupted by user. Exiting...")
 
-finally:
-    cap.release()
-    cv2.destroyAllWindows()
-    print("Video stream stopped.")
+# --- Main Face Recognition Loop ---
+if __name__ == "__main__":
+    ff_cap = None
+    capture_thread = None # Thread object
+    known_face_encodings = []
+    known_face_names = []
+    last_processed_frame_data = [] # Store data from last processed frame
+    frame_counter_process = 0 # Counter for processing interval
 
+    # --- Load Known Encodings ---
+    try:
+        print(f"Loading known face encodings from {ENCODING_FILE}...")
+        with open(ENCODING_FILE, "rb") as f: data = pickle.load(f)
+        known_face_encodings = np.array(data["encodings"])
+        known_face_names = data["names"]
+        if len(known_face_encodings) == 0: raise ValueError("No encodings found.")
+        print(f"Loaded {len(known_face_encodings)} encodings for {len(set(known_face_names))} people.")
+    except FileNotFoundError: print(f"Error: Encoding file '{ENCODING_FILE}' not found."); exit()
+    except Exception as e: print(f"Error loading encoding file: {e}"); exit()
+    # ----------------------------
+
+    # --- Initialize Models ---
+    print("Initializing MediaPipe Face Detection...")
+    mp_face_detection = mp.solutions.face_detection
+    face_detection = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
+
+    print(f"Initializing InceptionResnetV1 (FaceNet) on {BATCH_DEVICE}...")
+    try: resnet = InceptionResnetV1(pretrained='vggface2').eval().to(BATCH_DEVICE)
+    except Exception as e: print(f"Error initializing FaceNet: {e}"); exit()
+    # --------------------------
+
+    try:
+        # 1. Initialize FFmpeg capture
+        ff_cap = FFMPEGPipeCapture(CAMERA_DSHOW_NAME, CAM_WIDTH, CAM_HEIGHT, CAM_FPS)
+        if not ff_cap.is_opened(): raise RuntimeError(f"Could not open camera '{CAMERA_DSHOW_NAME}'.")
+
+        # --- Start Capture Thread ---
+        print("Starting capture thread...")
+        capture_thread = threading.Thread(target=capture_thread_func, args=(ff_cap,), daemon=True)
+        capture_thread.start()
+        # --------------------------
+
+        # --- Camera Warmup (using shared frame) ---
+        print(f"Warming up camera (waiting for first frame)...")
+        warmup_start = time.time()
+        while time.time() - warmup_start < 5.0: # Wait up to 5 seconds for first frame
+             with frame_lock:
+                  if latest_frame is not None:
+                       print("First frame received. Warmup complete.")
+                       break
+             time.sleep(0.1) # Wait a bit before checking again
+        else: # If loop finishes without break
+             raise RuntimeError("Failed to get first frame from capture thread during warmup.")
+        # --------------------
+
+        print("\nStarting face recognition loop. Press 'q' in window to stop.")
+        fps_frame_count = 0
+        start_time = time.time()
+
+        # --- Main Processing Loop ---
+        while not stop_event.is_set():
+            # 2. Get the latest frame from the capture thread
+            current_frame_bgr = None
+            with frame_lock:
+                if latest_frame is not None:
+                    current_frame_bgr = latest_frame.copy()
+
+            if current_frame_bgr is None:
+                # If capture thread hasn't provided a frame yet, wait briefly
+                time.sleep(0.01)
+                continue
+
+            frame_counter_process += 1
+
+            # --- Process only every Nth frame ---
+            if frame_counter_process % FRAME_PROCESS_INTERVAL == 0:
+                last_processed_frame_data = []
+                preprocessed_faces = []
+                boxes_for_drawing = []
+
+                # Convert to RGB and make contiguous
+                frame_rgb_non_contig = current_frame_bgr[:, :, ::-1]
+                frame_rgb = np.ascontiguousarray(frame_rgb_non_contig, dtype=np.uint8)
+
+                # 3. Detect Faces (MediaPipe)
+                frame_rgb.flags.writeable = False
+                results = face_detection.process(frame_rgb)
+
+                # 4. Preprocess all detected faces for batching
+                if results.detections:
+                    ih, iw, _ = frame_rgb.shape
+                    for detection in results.detections:
+                        bboxC=detection.location_data.relative_bounding_box
+                        if not hasattr(bboxC,'xmin')or bboxC.xmin is None:continue
+                        xmin=max(0,int(bboxC.xmin*iw));ymin=max(0,int(bboxC.ymin*ih))
+                        width=int(bboxC.width*iw);height=int(bboxC.height*ih)
+                        right=min(iw,xmin+width);bottom=min(ih,ymin+height)
+                        left=xmin;top=ymin
+                        box=(top,right,bottom,left)
+                        if right<=left or bottom<=top:continue
+                        face_crop_np=frame_rgb[top:bottom,left:right]
+                        if face_crop_np.size==0:continue
+                        face_crop_pil=Image.fromarray(face_crop_np)
+                        face_tensor=preprocess_face_tensor(face_crop_pil,"cpu")
+                        if face_tensor is not None:
+                            preprocessed_faces.append(face_tensor)
+                            boxes_for_drawing.append(box)
+
+
+                # --- 5. Batch Embedding Generation and Comparison ---
+                if preprocessed_faces:
+                    try:
+                        batch_face_tensors=torch.stack(preprocessed_faces).to(BATCH_DEVICE)
+                        live_embeddings_batch=None
+                        with torch.no_grad():
+                            live_embeddings_batch_tensor=resnet(batch_face_tensors)
+                            live_embeddings_batch=live_embeddings_batch_tensor.cpu().numpy()
+                        if live_embeddings_batch is not None:
+                            for i in range(len(live_embeddings_batch)):
+                                live_encoding=live_embeddings_batch[i]
+                                current_box=boxes_for_drawing[i]
+                                name="Unknown";min_dist=RECOGNITION_THRESHOLD
+                                distances=np.linalg.norm(known_face_encodings-live_encoding,axis=1)
+                                best_match_index=np.argmin(distances)
+                                min_dist=distances[best_match_index]
+                                if min_dist<RECOGNITION_THRESHOLD:
+                                    name=known_face_names[best_match_index]
+                                last_processed_frame_data.append((current_box,name,min_dist))
+                    except Exception as batch_e:
+                        print(f"Batch embed/compare err: {batch_e}")
+                        last_processed_frame_data=[] # Clear results on error
+
+            # --- End Frame Processing Block ---
+
+            # 6. Draw Results (Always draw using the *last processed* data on the current frame)
+            display_frame = current_frame_bgr # Draw on the frame grabbed for this loop iteration
+            for (top, right, bottom, left), name, dist in last_processed_frame_data:
+                label = f"{name} ({dist:.2f})"
+                cv2.rectangle(display_frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                y = top - 15 if top - 15 > 15 else top + 15
+                cv2.putText(display_frame, label, (left, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            # 7. Display Frame (Always display)
+            cv2.imshow('Face Recognition (Q to Quit)', display_frame)
+            fps_frame_count += 1
+
+            # 8. Check for Quit Key
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("Quit key pressed.")
+                stop_event.set() # Signal capture thread to stop
+                break
+
+            # Calculate Display FPS
+            elapsed_time = time.time() - start_time
+            if elapsed_time >= 1.0:
+                fps = fps_frame_count / elapsed_time
+                print(f"Display FPS: {fps:.2f}")
+                fps_frame_count = 0
+                start_time = time.time()
+
+    except KeyboardInterrupt: print("\nStopping loop (Ctrl+C)..."); stop_event.set()
+    except RuntimeError as e: print(f"Runtime Error: {e}"); stop_event.set()
+    except Exception as e: print(f"An unexpected error occurred: {e}"); stop_event.set()
+    finally:
+        # --- Clean up ---
+        if stop_event: stop_event.set() # Ensure event is set
+        if capture_thread:
+             print("Waiting for capture thread to finish...")
+             capture_thread.join(timeout=2.0) # Wait for thread to exit
+             if capture_thread.is_alive():
+                  print("Capture thread did not finish cleanly.")
+        if 'face_detection' in locals() and face_detection: face_detection.close()
+        if ff_cap is not None: ff_cap.release() # Release ffmpeg pipe AFTER thread finishes
+        cv2.destroyAllWindows()
+        print("Resources released.")
