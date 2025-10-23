@@ -60,7 +60,7 @@ The project uses a modern deep learning approach for high-accuracy face recognit
             ```
 
 4.  **Install Python Dependencies**
-    * All other required libraries are listed in `requirements.txt`. Install them using `pip`:
+    * All required libraries are listed in `requirements.txt`. Install them using `pip`:
     ```bash
     pip install -r requirements.txt
     ```
