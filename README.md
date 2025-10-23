@@ -2,20 +2,26 @@
 
 ## Real-Time Face Recognition Project
 
-This project implements a complete real-time face recognition pipeline using Python, OpenCV, FaceNet, and FFmpeg. The system is broken into three main scripts:
+This project implements a real-time face recognition pipeline using Python. It captures video via FFmpeg, detects faces using MediaPipe, generates embeddings using FaceNet (via `facenet-pytorch`), and recognizes known faces against a pre-encoded database.
 
-1.  `capture_faces.py`: Collects and stores face images using FFmpeg (or OpenCV fallback) to build a dataset.
-2.  `encode_faces.py`: Processes the collected images using FaceNet (via `facenet-pytorch`) to create known face embeddings.
-3.  `recognize_faces.py`: Performs real-time face recognition using a live webcam feed captured via FFmpeg, leveraging FaceNet for detection and recognition, with optimizations like frame skipping.
+The system is divided into three main scripts:
+
+1.  `capture_faces.py`: Collects face images using FFmpeg and MediaPipe to build a dataset of known individuals.
+2.  `encode_faces.py`: Processes the collected images using MTCNN for detection and FaceNet (`InceptionResnetV1`) to create and save embeddings for known faces. Includes batch processing, resizing, and optional deletion of problematic images.
+3.  `recognize_faces.py`: Performs real-time face recognition using a live webcam feed (via FFmpeg), detecting faces with MediaPipe, generating live embeddings with FaceNet, and matching against the saved database. Uses threading and frame skipping for optimization.
 
 ## How It Works
 
 The project uses a modern deep learning approach for high-accuracy face recognition:
 
-* **Camera Capture**: It primarily uses **FFmpeg** via a subprocess pipe for robust camera access on Windows (DirectShow). If FFmpeg fails, it falls back to using **OpenCV** `VideoCapture`. Includes logic for camera warmup and automatic reopening on errors.
-* **Face Detection**: It uses a **Multi-Task Cascaded Neural Network (MTCNN)** from the `facenet-pytorch` library to accurately detect faces in images (`encode_faces.py`) and video frames (`recognize_faces.py`). `capture_faces.py` uses the `face_recognition` library's detector with an OpenCV Haar Cascade fallback for dataset creation.
-* **Face Embedding**: For each detected face, it uses a pre-trained **InceptionResnetV1 (FaceNet)** model (via `facenet-pytorch`) to compute a 512-dimension vector (an "embedding") that numerically represents the face.
-* **Face Matching**: The recognition script compares the embeddings of faces seen on the webcam against a pre-computed database of "known" embeddings using efficient vectorized NumPy calculations. A distance calculation (Euclidean distance with a tolerance) determines if the face is a match or "Unknown".
+* **Camera Capture**: Uses **FFmpeg** via a subprocess pipe (`FFMPEGPipeCapture` class) for robust camera access (specifically targeting Windows DirectShow). Captures raw BGR frames.
+* **Face Detection**:
+    * `capture_faces.py` & `recognize_faces.py`: Use **MediaPipe Face Detection** for fast and reliable bounding box detection on CPU/GPU.
+    * `encode_faces.py`: Uses **MTCNN** (from `facenet-pytorch`) for potentially higher accuracy detection during the offline encoding phase, with batch processing and fallback.
+* **Face Embedding**: A pre-trained **InceptionResnetV1 (FaceNet)** model from `facenet-pytorch` (trained on VGGFace2) computes a 512-dimension vector (embedding) for each detected face.
+* **Encoding**: The `encode_faces.py` script iterates through the `dataset` folder, detects faces, generates embeddings, and saves them along with corresponding names into a `.pickle` file (`encodings_facenet.pickle`).
+* **Recognition**: The `recognize_faces.py` script loads the saved embeddings. In real-time, it detects faces, computes their live embeddings, and calculates the Euclidean distance to all known embeddings. If the minimum distance is below a set `RECOGNITION_THRESHOLD`, the corresponding name is assigned; otherwise, it's labeled "Unknown".
+* **Optimization**: The recognition script uses **threading** to decouple camera capture from processing and processes only every Nth frame (`FRAME_PROCESS_INTERVAL`) to prevent accumulating lag. Embeddings for multiple faces in a frame are generated in batches.
 
 ## Installation
 
@@ -25,13 +31,15 @@ The project uses a modern deep learning approach for high-accuracy face recognit
     cd RBC26_Recruitment_Face_Recognition_Project
     ```
 
-2.  **Install FFmpeg** (Required for Primary Camera Capture)
-    ```bash
-    winget install --id=Gyan.FFmpeg -e
-    ```
+2.  **Install FFmpeg** (Required for Camera Capture)
+    * **Windows (using Winget):**
+        ```bash
+        winget install --id=Gyan.FFmpeg -e
+        ```
+    * **Other OS / Manual:** Download from the [FFmpeg website](https://ffmpeg.org/download.html) and ensure the `ffmpeg` executable is in your system's PATH.
 
-4.  **Create a Virtual Environment** (Recommended)
-    * Using Python 3.11 is suggested as the provided `dlib` wheel is for this version.
+3.  **Create a Virtual Environment** (Recommended)
+    * Using Python 3.9+ is generally recommended for recent versions of these libraries (here we use python3.11.9).
     ```bash
     py -3.11 -m venv face_rec
     ```
@@ -51,76 +59,83 @@ The project uses a modern deep learning approach for high-accuracy face recognit
             source face_rec/bin/activate
             ```
 
-5.  **Install the pre-compiled package for `dlib`**
-    * The `face-recognition` library depends on `dlib`, which can sometimes be tricky to install directly. Using the provided wheel file for Windows/Python 3.11 is the easiest way if it matches your system. Make sure the `.whl` file is in your project directory.
-    ```bash
-    python -m pip install dlib-19.24.1-cp311-cp311-win_amd64.whl
-    ```
-    > **Note:** If you are not on 64-bit Windows with Python 3.11, you might need to find a different `dlib` wheel file or try installing `dlib` directly (`pip install dlib`), which may require installing CMake and a C++ compiler first.
-
-6.  **Install Other Dependencies**
+4.  **Install Python Dependencies**
     * All other required libraries are listed in `requirements.txt`. Install them using `pip`:
     ```bash
     pip install -r requirements.txt
     ```
-    > **GPU Support:** If you have a CUDA-enabled NVIDIA GPU and the correct NVIDIA drivers installed, `torch` should automatically install with GPU support. This significantly speeds up the face detection and embedding process. If not, it will default to using the CPU.
+    > * **(GPU Support):** If you have a CUDA-enabled NVIDIA GPU, ensure you have the correct NVIDIA drivers and CUDA Toolkit installed. Then, install the GPU version of PyTorch by following the instructions on the [PyTorch website](https://pytorch.org/get-started/locally/). This will significantly speed up encoding and recognition.
 
 ## Usage (Step-by-Step)
 
 Follow these steps in order to run the project.
 
-### Step 1: Capture Faces
+### Step 1: Find Your Camera Name (Important!)
 
-First, build a dataset of known faces. Run the `capture_faces.py` script.
+```bash
+ffmpeg -list_devices true -f dshow -i dummy
+```
+
+- Look for your webcam under "DirectShow video devices". Common names include "Integrated Camera", "USB Video Device", or the specific model name.
+
+```bash
+# Replace <CAMERA_NAME> with the exact name found above
+ffmpeg -f dshow -list_options true -i video="<CAMERA_NAME>"
+```
+
+- Update the CAMERA_DSHOW_NAME variable at the top of capture_faces.py and recognize_faces.py with the exact name found. You might also want to adjust CAM_WIDTH, CAM_HEIGHT, and CAM_FPS based on your camera's capabilities and desired performance.
+
+### Step 2: Capture Faces (capture_faces.py)
+
+Build your dataset of known faces.
 
 ```bash
 python capture_faces.py
 ```
 
-- You will be prompted to enter a name for the person.
-- A new folder with this name will be created in the `dataset/` directory.
-- The script will attempt to open the webcam specified by `CAMERA_NAME` using FFmpeg. If it fails, it will try the OpenCV fallback.
-- A webcam window will open after warmup. Position your face in the frame.
-- Press the `s` key to save a frame. The script will only save when exactly one face is detected (using `face_recognition` or Haar cascade).
-- Collect around 50 images for good results, varying angles and lighting slightly.
-- Press `q` to quit when finished.
+- Enter a name for the person when prompted.
+- A folder `dataset/<name>` will be created.
+- A window will show the camera feed. Position your face.
+- Press `s` to save the detected face crop. The script uses MediaPipe to detect faces and saves the cropped BGR image.
+- Collect multiple images (e.g., 20-50) per person with slight variations.
+- Press `q` to quit capturing for the current person.
+- Run the script again for each new person.
 
-Repeat this process for each person you want to add to the dataset.
+### Step 3: Encode Faces (encode_faces.py)
 
-### Step 2: Encode Faces
-
-Next, process the captured images into FaceNet embeddings.
+Process the captured images to create embeddings.
 
 ```bash
 python encode_faces.py
 ```
 
-- This script will scan the `dataset/` directory.
-- For each image, it uses MTCNN to detect the face, then computes its 512-d FaceNet embedding using `InceptionResnetV1`.
-- All embeddings and their corresponding names are saved to `encodings_facenet.pickle`.
-- You only need to run this script once after you've added or changed images in the `dataset` folder.
+- Scans the `dataset/` directory.
+- Resizes images, uses MTCNN to detect faces (with fallback for tricky batches), computes FaceNet embeddings.
+- Optionally deletes images that cause errors or where no face is detected (controlled by `DELETE_FAILED_IMAGES` flag in the script).
+- Saves embeddings and names to `encodings_facenet.pickle`.
+- Run this whenever you add/change images in the `dataset` folder.
 
-### Step 3: Recognize Faces
+### Step 4: Recognize Faces (recognize_faces.py)
 
-Finally, run the real-time recognition script.
+Run the real-time recognition.
 
 ```bash
 python recognize_faces.py
 ```
 
-- This will load the `encodings_facenet.pickle` file.
-- It will open your webcam using the FFmpeg method (with OpenCV fallback).
-- It detects faces using MTCNN and computes FaceNet embeddings every few frames (`FRAME_SKIP` setting).
-- For each detected face, it computes its embedding and compares it to all known embeddings using fast NumPy calculations.
-- A green box (for known faces) or red box (for "Unknown" faces) will be drawn, along with a name label. Skipped frames reuse the previous detection results for smooth display.
-- Press `q` to quit the video stream.
+- Loads `encodings_facenet.pickle`.
+- Starts the camera feed via FFmpeg (using threading).
+- Detects faces (MediaPipe), generates embeddings (FaceNet), and compares them every few frames (`FRAME_PROCESS_INTERVAL`).
+- Draws boxes and labels (Name or "Unknown" + distance) on the video feed.
+- Press `q` to quit.
 
 ### Core Dependencies
 
-- `opencv-python`: For image processing, drawing, fallback camera access, and Haar cascade.
-- `face-recognition`: Used for face detection (in capture_faces.py), comparison, and distance calculations. Depends on dlib.
-- `torch`: The core deep learning framework.
-- `facenet-pytorch`: Provides pre-trained MTCNN (detection) and InceptionResnetV1 (embedding) models.
-- `numpy`: For numerical operations on image and embedding arrays.
-- `Pillow` (PIL): Used for image manipulation and compatibility between OpenCV and PyTorch.
-- `imutils`: For convenience functions like resizing video frames.
+- `FFmpeg`: External tool for robust camera capture.
+- `opencv-python`: For displaying video, drawing shapes, saving images (imwrite), and image format conversions.
+- `mediapipe`: For fast face detection in the capture and recognition scripts.
+- `torch` & `torchvision`: Core deep learning framework.
+- `facenet-pytorch`: Provides pre-trained MTCNN (detector for encoding) and InceptionResnetV1 (FaceNet embedder).
+- `numpy`: For numerical operations, especially on image arrays and embeddings.
+- `Pillow` (PIL): Used for image loading and resizing during encoding.
+- `tqdm`: Displays progress bars during encoding.
