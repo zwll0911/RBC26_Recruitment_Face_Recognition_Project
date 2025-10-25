@@ -68,7 +68,7 @@ The project uses a modern deep learning approach for high-accuracy face recognit
 7.  **Install Python Dependencies**
     * All required libraries are listed in `requirements.txt`. Install them using `pip`:
     ```bash
-    pip install -r requirements.txt
+    python -m pip install -r requirements.txt
     ```
     > * **(GPU Support):** If you have a CUDA-enabled NVIDIA GPU, ensure you have the correct NVIDIA drivers and CUDA Toolkit installed. Then, install the GPU version of PyTorch by following the instructions on the [PyTorch website](https://pytorch.org/get-started/locally/). This will significantly speed up encoding and recognition.
 
