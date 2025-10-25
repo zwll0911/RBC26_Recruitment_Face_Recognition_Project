@@ -25,20 +25,26 @@ The project uses a modern deep learning approach for high-accuracy face recognit
 
 ## Installation
 
-1.  **Clone the Repository**
+1.  **Install Git**
+    ```bash
+    winget install --id Git.Git -e
+    ```
+    After installation, remember to open a new terminal. 
+
+3.  **Clone the Repository**
     ```bash
     git clone https://github.com/zwll0911/RBC26_Recruitment_Face_Recognition_Project.git
     cd RBC26_Recruitment_Face_Recognition_Project
     ```
 
-2.  **Install FFmpeg** (Required for Camera Capture)
+5.  **Install FFmpeg** (Required for Camera Capture)
     * **Windows (using Winget):**
         ```bash
         winget install --id=Gyan.FFmpeg -e
         ```
     * **Other OS / Manual:** Download from the [FFmpeg website](https://ffmpeg.org/download.html) and ensure the `ffmpeg` executable is in your system's PATH.
 
-3.  **Create a Virtual Environment** (Recommended)
+6.  **Create a Virtual Environment** (Recommended)
     * Using Python 3.9+ is generally recommended for recent versions of these libraries (here we use python 3.11.9).
     ```bash
     py -3.11 -m venv face_rec
@@ -47,7 +53,7 @@ The project uses a modern deep learning approach for high-accuracy face recognit
         * **Windows (PowerShell):**
             ```powershell
             # You might need to allow script execution first (run PowerShell as Administrator)
-            # Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+            Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
             .\face_rec\Scripts\activate
             ```
         * **Windows (Command Prompt):**
@@ -59,7 +65,7 @@ The project uses a modern deep learning approach for high-accuracy face recognit
             source face_rec/bin/activate
             ```
 
-4.  **Install Python Dependencies**
+7.  **Install Python Dependencies**
     * All required libraries are listed in `requirements.txt`. Install them using `pip`:
     ```bash
     pip install -r requirements.txt
